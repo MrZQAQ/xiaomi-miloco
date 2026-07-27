@@ -31,7 +31,7 @@
 ### 能力边界
 
 - 感知以时间窗口为单位触发；每台摄像头独立流水线，身份库全局共享
-- 感知质量取决于摄像头画质、光线条件和 VLM（MiMo）的理解能力，存在误判率
+- 感知质量取决于摄像头画质、光线条件和 VLM 的理解能力，存在误判率。支持多 provider：MiMo、Qwen3.5-Omni、Qwen3-VL / Qwen2.5-VL、Gemini（见 `provider.py` 的 `get_adapter` 路由）
 - 规则条件由 VLM 自然语言推理，非精确传感器；不适合需要精确数值判定的场景（"温度超过 28 度"应走传感器，不走感知流水线）
 - 仅处理 RGB 彩色画面，不处理纯红外/热成像摄像头
 - 感知范围可管理但有约束：账号含多个家庭时同一时刻只感知一个（切换即换，其余自动停用）；家庭内摄像头默认全部接入、可按需停用，且同时启用的摄像头数有上限。范围经 `miloco-miot-scope` Skill / `/api/miot/scope/*` 端点管理，改动热同步生效无需重启
@@ -104,9 +104,18 @@ Identity 层编排器（`perception/engine/identity/identity.py`）编排两条�
 
 #### Omni — VLM 场景推理
 
-Omni 层（`engine/omni/omni.py`）调用视觉语言模型（MiMo API，OpenAI 兼容协议），输入 `IdentityPacket`，输出结构化的 `OmniOutput`。
+Omni 层（`engine/omni/omni.py`）调用视觉语言模型（多 provider 支持，见下文 Provider Adapter），输入 `IdentityPacket`，输出结构化的 `OmniOutput`。
 
 两类调用入口：实时感知（含 fused 模式，将身份识别合并到主调用，当前默认）和主动查询（非流式，跳过 Gate 直接推理）。核心编排在 `engine/omni/omni.py`。
+
+**Provider Adapter 体系**（`engine/omni/provider.py`）：`OmniProviderAdapter` 抽象基类定义统一的协议接口（`build_video_block` / `build_audio_block` / `build_request_body` / `parse_response` 等），各 provider 子类实现各自的协议差异：
+
+- `MiMoAdapter`（`OpenAICompatAdapter` 子类，默认）：原生支持 `video_url` + `input_audio`，含 `thinking: disabled`
+- `QwenOmniAdapter`：Qwen3.5-Omni 系列，视频块不传 MIME/fps 字段（Qwen 从 mp4 容器自读），请求体强制 `stream: true` + `modalities: ["text"]`
+- `Qwen3VLAdapter`：Qwen3-VL / Qwen2.5-VL 纯视觉 VLM（不含 omni 音频能力），不支持 `video_url` 输入，以多帧 JPEG `image_url` 替代。类属性 `supports_video_input = False` 让上游（`prompt_builder._build_fused_user_content` 和 `omni_client._build_messages`）通过 `getattr(adapter, 'supports_video_input', True)` 安全分支，默认 `True` 保证现有 adapter 行为不变
+- `GeminiAdapter`：Gemini 原生 `generateContent` 协议（OpenAI 兼容端点不支持视频输入）
+
+`get_adapter(model)` 按子串匹配自动路由：含 `vl` → `Qwen3VLAdapter`，含 `qwen` 但不含 `vl` → `QwenOmniAdapter`，含 `gemini` → `GeminiAdapter`，其余 → `MiMoAdapter`。
 
 **两种 route 语义**：Omni 层根据当前窗口是否有视觉变化选择 video 或 audio 路由。audio route 仅发送音频（无视频），省去视觉相关输出字段，降低 token 消耗。
 
@@ -147,6 +156,8 @@ Omni 层（`engine/omni/omni.py`）调用视觉语言模型（MiMo API，OpenAI 
 | 修改 Gate 触发阈值                      | `perception/engine/gate/visual_gate.py`（视觉）、`gate/audio_gate.py`（音频）                |
 | 修改 VLM 输出字段定义（schema/说明）    | `perception/engine/omni/field_registry.py`（`FieldSpec` 单一来源）                           |
 | 修改 VLM prompt 组装逻辑                | `perception/engine/omni/prompt_builder.py`                                                   |
+| 修改/新增 VLM provider 适配             | `perception/engine/omni/provider.py`（`get_adapter` 路由 + Adapter 子类）                   |
+| 修改 Omni API 调用客户端（HTTP/流式）   | `perception/engine/omni/omni_client.py`（`_build_messages` / `call_omni` / `call_omni_stream`）|
 | 修改家庭档案注入 Omni 的方式            | `perception/engine/omni/home_profile_loader.py`                                              |
 | 修改身份识别逻辑                        | `perception/engine/identity/engine.py`（识别状态机）、`tracking_service.py`（DeepSORT 跟踪） |
 | 修改感知结果后处理（规则上报/事件投递） | `perception/client.py`（`PerceptionEngineProxy`，`handle_realtime_perception_result`）       |

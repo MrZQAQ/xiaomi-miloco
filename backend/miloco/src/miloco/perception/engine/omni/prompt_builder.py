@@ -254,6 +254,7 @@ def build_fused_payload(
 
     short_edge = _get_video_short_edge()
     video_b64, media_info = _encode_batch_video(packets, short_edge=short_edge)
+    image_blocks = _encode_frames_to_images(packets, short_edge=short_edge)
 
     # has_speech 只由本轮 VAD 决定：本轮真有人声（含 pending 的延续语音）→ VAD 自然过、
     # 保留 speeches、模型把 <pending_speech> 拼成完整句；本轮无人声 → 剥 speeches，挂着的
@@ -272,6 +273,7 @@ def build_fused_payload(
         gallery_snapshot=gallery_snapshot,
         video_b64=video_b64,
         media_info=media_info,
+        image_blocks=image_blocks,
         adapter=adapter,
         cfg=cfg,
         label_lookup=label_lookup,
@@ -395,6 +397,7 @@ def _build_payload(
         video_b64, media_info = _encode_batch_video(packets, short_edge=short_edge)
         base["video_base64"] = video_b64
         base["media_info"] = media_info
+        base["image_blocks"] = _encode_frames_to_images(packets, short_edge=short_edge)
     return base
 
 
@@ -596,6 +599,7 @@ def _build_fused_user_content(
     gallery_snapshot: dict[str, "GallerySamples"],
     video_b64: str | None,
     media_info: LocalMediaInfo | None,
+    image_blocks: list[str] | None = None,
     adapter: OmniProviderAdapter,
     cfg: FusedPromptConfig,
     label_lookup: "dict[str, str] | None" = None,
@@ -724,11 +728,23 @@ def _build_fused_user_content(
     # 4. gallery（候选成员参考图，紧邻 video 便于视觉比对）
     content.extend(gallery_content)
 
-    # 5. 主 video
+    # 5. 主 video / 多帧 image（取决于 adapter 是否支持 video_url 输入）
+    # adapter 不支持 video_url（如 Qwen3-VL）→ 以多帧 JPEG image_url 替代
     # video_b64 size sanity check — PyAV 编码异常情况下可能返回非空但损坏的极短
     # base64 串, 入 payload 会让 omni 服务端 400 Multimodal data is corrupted。
-    # 太短 → 跳过 video_url 块, 退化为"无视频窗口"(text + gallery 仍能识别)。
-    if video_b64 and len(video_b64) >= _MIN_VIDEO_B64_LEN:
+    # 太短 → 跳过, 退化为"无视频窗口"(text + gallery 仍能识别)。
+    if not getattr(adapter, "supports_video_input", True):
+        if image_blocks:
+            for img_b64 in image_blocks:
+                if img_b64 and img_b64.strip():
+                    content.append(adapter.build_image_block(img_b64))  # type: ignore[attr-defined]
+        elif video_b64 and len(video_b64) >= _MIN_VIDEO_B64_LEN:
+            logger.warning(
+                "event=fused_image_blocks_empty adapter=%s, 但 video_b64 可用; "
+                "Qwen3-VL 不支持 video_url 输入, 本窗口退化 text-only",
+                type(adapter).__name__,
+            )
+    elif video_b64 and len(video_b64) >= _MIN_VIDEO_B64_LEN:
         content.append(adapter.build_video_block(video_b64, media_info))
     elif video_b64:
         logger.warning(
@@ -1424,6 +1440,43 @@ def _encode_batch_video(
         if b64 is not None:
             return b64, media_info
     return None, None
+
+
+def _encode_frames_to_images(
+    edge_packets: list[IdentityPacket],
+    short_edge: int = _VIDEO_SHORT_EDGE,
+    max_frames: int = 10,
+) -> list[str]:
+    """Encode frames from the first device as individual base64 JPEG images.
+
+    For adapters that don't support video_url input (e.g. Qwen3-VL), this
+    provides frames as multiple ``image_url`` blocks instead of a single
+    ``video_url``. Frames are evenly sampled from the available frames up
+    to ``max_frames``.
+    """
+    for ep in edge_packets:
+        frames = ep.all_frames
+        if not frames:
+            continue
+
+        if len(frames) > max_frames:
+            step = len(frames) / max_frames
+            indices = [int(i * step) for i in range(max_frames)]
+            frames = [frames[i] for i in indices]
+
+        h0, w0 = frames[0].shape[:2]
+        scale = short_edge / min(h0, w0)
+        target_w = int(w0 * scale) // 2 * 2
+        target_h = int(h0 * scale) // 2 * 2
+
+        results: list[str] = []
+        for frame in frames:
+            resized = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_AREA)
+            _, jpg = cv2.imencode(".jpg", resized, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            results.append(base64.b64encode(jpg.tobytes()).decode())
+        return results
+
+    return []
 
 
 def _encode_batch_crops(edge_packets: list[IdentityPacket]) -> list[dict[str, str]]:

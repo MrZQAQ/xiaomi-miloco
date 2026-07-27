@@ -209,6 +209,58 @@ class QwenOmniAdapter(OpenAICompatAdapter):
         }
 
 
+class Qwen3VLAdapter(OpenAICompatAdapter):
+    """Qwen3-VL / Qwen2.5-VL 系列纯视觉 VLM adapter（不含 omni 音频能力）。
+
+    Qwen3.5-Omni 系列（qwen3.5-omni-plus/flash）走 ``QwenOmniAdapter``，本 adapter 仅
+    匹配含 ``vl`` 的纯视觉 Qwen 模型（如 ``qwen3-vl-...``、``qwen2.5-vl-...``）。
+
+    与 QwenOmniAdapter 的核心差异：
+    - 不支持 video_url 输入：以多帧 base64 JPEG image_url 替代
+    - 不支持 audio 输入
+    - 不强制 stream（Qwen3-VL 非流式可正常工作）
+    - 无 thinking / modalities 等 Qwen-Omni 专有字段
+    """
+
+    supports_video_input: bool = False
+    supports_audio_input: bool = False
+
+    def build_image_block(self, image_base64: str) -> dict[str, Any]:
+        """构建单帧 JPEG image_url 块（替代 video_url）。"""
+        return {
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"},
+        }
+
+    def build_video_block(self, video_base64: str, media: LocalMediaInfo) -> dict[str, Any]:
+        raise NotImplementedError(
+            "Qwen3VLAdapter does not support video_url input; "
+            "use image_blocks (multi-frame image_url) instead"
+        )
+
+    def build_audio_block(self, audio_base64: str, media: LocalMediaInfo) -> dict[str, Any]:
+        raise NotImplementedError("Qwen3VLAdapter does not support audio input")
+
+    def build_request_body(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        model: str,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        stream: bool = False,
+    ) -> dict[str, Any]:
+        return {
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+            "stream": False,
+        }
+
+
 def _parse_data_uri(url: str) -> tuple[str, str]:
     """把 ``data:<mime>;base64,<payload>`` 拆成 ``(mime_type, base64_payload)``。
 
@@ -462,19 +514,23 @@ def adjust_fps_for_omni(fps: int, omni_fps: int) -> int:
 
 _DEFAULT_ADAPTER = MiMoAdapter()
 _QWEN_ADAPTER = QwenOmniAdapter()
+_QWEN_VL_ADAPTER = Qwen3VLAdapter()
 _GEMINI_ADAPTER = GeminiAdapter()
 
 
 def get_adapter(model: str) -> OmniProviderAdapter:
     """按 model 字符串返回对应 adapter，默认 MiMo。
 
-    Qwen 侧仅支持 Qwen3.5-Omni 系列（qwen3.5-omni-plus / qwen3.5-omni-flash），
-    旧版 qwen3-omni-flash 不支持多模态组合输入，无法满足 fused 模式需求。
+    Qwen 系列路由：
+    - 含 ``vl`` 的纯视觉 VLM（qwen3-vl、qwen2.5-vl、qwen2-vl 等）→ ``Qwen3VLAdapter``
+    - 其他含 ``qwen`` 的模型（qwen3.5-omni-plus/flash 等）→ ``QwenOmniAdapter``
 
     Gemini 走原生 generateContent 协议（OpenAI 兼容端点不支持视频输入）。
     """
     name = model.lower()
     if "qwen" in name:
+        if "vl" in name:
+            return _QWEN_VL_ADAPTER
         return _QWEN_ADAPTER
     if "gemini" in name:
         return _GEMINI_ADAPTER

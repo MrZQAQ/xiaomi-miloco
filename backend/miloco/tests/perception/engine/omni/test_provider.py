@@ -6,6 +6,7 @@ from miloco.perception.engine.omni.provider import (
     LocalMediaInfo,
     MiMoAdapter,
     OpenAICompatAdapter,
+    Qwen3VLAdapter,
     QwenOmniAdapter,
     get_adapter,
 )
@@ -51,6 +52,37 @@ class TestGetAdapter:
         assert isinstance(get_adapter("xiaomi/mimo-v2.5"), OpenAICompatAdapter)
         assert isinstance(get_adapter("qwen3.5-omni-flash"), OpenAICompatAdapter)
         assert not isinstance(get_adapter("gemini-3-flash-preview"), OpenAICompatAdapter)
+
+    def test_qwen_vl_routes_to_qwen3vl(self):
+        assert isinstance(get_adapter("qwen3-vl-8b"), Qwen3VLAdapter)
+
+    def test_qwen2_5_vl_routes_to_qwen3vl(self):
+        assert isinstance(get_adapter("qwen2.5-vl-7b"), Qwen3VLAdapter)
+
+    def test_qwen2_vl_routes_to_qwen3vl(self):
+        assert isinstance(get_adapter("qwen2-vl-2b"), Qwen3VLAdapter)
+
+    def test_qwen_vl_case_insensitive(self):
+        assert isinstance(get_adapter("Qwen3-VL-8B"), Qwen3VLAdapter)
+
+    def test_qwen_vl_takes_priority_over_qwen_omni(self):
+        """含 vl 的纯视觉 Qwen 应走 Qwen3VLAdapter，而非 QwenOmniAdapter。"""
+        assert isinstance(get_adapter("qwen3-vl-8b"), Qwen3VLAdapter)
+        assert not isinstance(get_adapter("qwen3-vl-8b"), QwenOmniAdapter)
+
+    def test_qwen_vl_supports_video_input_false(self):
+        a = get_adapter("qwen3-vl-8b")
+        assert getattr(a, "supports_video_input", True) is False
+
+    def test_qwen_vl_supports_audio_input_false(self):
+        a = get_adapter("qwen3-vl-8b")
+        assert getattr(a, "supports_audio_input", True) is False
+
+    def test_qwen_vl_is_openai_compat_family(self):
+        assert isinstance(get_adapter("qwen3-vl-8b"), OpenAICompatAdapter)
+
+    def test_qwen_vl_singleton(self):
+        assert get_adapter("qwen3-vl-8b") is get_adapter("qwen2.5-vl-7b")
 
     def test_singleton(self):
         assert get_adapter("xiaomi/mimo-v2.5") is get_adapter("xiaomi/mimo-v2.5")
@@ -307,3 +339,77 @@ class TestGeminiAdapter:
         )
         assert delta is None
         assert usage == {"prompt_tokens": 5, "completion_tokens": 2}
+
+
+class TestQwen3VLAdapter:
+    adapter = Qwen3VLAdapter()
+
+    def test_build_image_block_jpeg_base64(self):
+        block = self.adapter.build_image_block("abc123")
+        assert block["type"] == "image_url"
+        assert block["image_url"]["url"] == "data:image/jpeg;base64,abc123"
+
+    def test_build_image_block_empty_string(self):
+        block = self.adapter.build_image_block("")
+        assert block["type"] == "image_url"
+        assert block["image_url"]["url"] == "data:image/jpeg;base64,"
+
+    def test_build_video_block_raises_not_implemented(self):
+        import pytest
+        with pytest.raises(NotImplementedError, match="image_blocks"):
+            self.adapter.build_video_block("test", _VIDEO_MEDIA)
+
+    def test_build_audio_block_raises_not_implemented(self):
+        import pytest
+        with pytest.raises(NotImplementedError, match="audio"):
+            self.adapter.build_audio_block("test", _AUDIO_MEDIA)
+
+    def test_request_body_forces_non_stream(self):
+        body = self.adapter.build_request_body(
+            _MESSAGES, model="qwen3-vl-8b",
+            max_tokens=512, temperature=0.1, top_p=0.95, stream=True,
+        )
+        assert body["stream"] is False
+        assert "stream_options" not in body
+
+    def test_request_body_no_thinking_no_modalities(self):
+        body = self.adapter.build_request_body(
+            _MESSAGES, model="qwen3-vl-8b",
+            max_tokens=512, temperature=0.1, top_p=0.95,
+        )
+        assert "thinking" not in body
+        assert "modalities" not in body
+
+    def test_request_body_basic_fields(self):
+        body = self.adapter.build_request_body(
+            _MESSAGES, model="qwen3-vl-8b",
+            max_tokens=1024, temperature=0.3, top_p=0.9,
+        )
+        assert body["model"] == "qwen3-vl-8b"
+        assert body["messages"] == _MESSAGES
+        assert body["max_tokens"] == 1024
+        assert body["temperature"] == 0.3
+        assert body["top_p"] == 0.9
+
+    def test_endpoint_openai_compat(self):
+        url = self.adapter.endpoint("https://api/v1", "qwen3-vl-8b", stream=False)
+        assert url == "https://api/v1/chat/completions"
+
+    def test_auth_headers_bearer(self):
+        assert self.adapter.auth_headers("KEY") == {"Authorization": "Bearer KEY"}
+
+    def test_parse_response_passthrough(self):
+        raw = {"choices": [{"message": {"content": "hi"}}]}
+        assert self.adapter.parse_response(raw) is raw
+
+    def test_parse_stream_chunk_delta(self):
+        delta, usage = self.adapter.parse_stream_chunk(
+            {"choices": [{"delta": {"content": "hello"}}]}
+        )
+        assert delta == "hello"
+        assert usage is None
+
+    def test_class_attributes(self):
+        """supports_video_input 和 supports_audio_input 应为 False（类级别属性）。"""
+        assert Qwen3VLAdapter.supports_video_input is False
+        assert Qwen3VLAdapter.supports_audio_input is False

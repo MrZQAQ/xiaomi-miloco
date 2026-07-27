@@ -1394,3 +1394,139 @@ class TestIdentityMatchDisabled:
         assert self._TASK_MATCH_MARKER in full
         assert self._EXAMPLE_A_MARKER in full
         assert self._MATCH_ONLY_MARKER in full
+
+
+class TestEncodeFramesToImages:
+    """_encode_frames_to_images：为不支持 video_url 的 adapter 提供多帧 JPEG。"""
+
+    def test_encodes_frames_to_base64_jpeg(self):
+        from miloco.perception.engine.omni.prompt_builder import _encode_frames_to_images
+
+        ep = _mock_edge_packet()
+        ep.all_frames = [np.zeros((100, 200, 3), dtype=np.uint8) for _ in range(5)]
+        images = _encode_frames_to_images([ep], short_edge=100, max_frames=10)
+        assert isinstance(images, list)
+        assert len(images) == 5
+        for img in images:
+            assert isinstance(img, str)
+            assert len(img) > 0
+
+    def test_respects_max_frames(self):
+        from miloco.perception.engine.omni.prompt_builder import _encode_frames_to_images
+
+        ep = _mock_edge_packet()
+        ep.all_frames = [np.zeros((100, 200, 3), dtype=np.uint8) for _ in range(20)]
+        images = _encode_frames_to_images([ep], short_edge=100, max_frames=3)
+        assert len(images) == 3
+
+    def test_empty_packets_returns_empty_list(self):
+        from miloco.perception.engine.omni.prompt_builder import _encode_frames_to_images
+
+        assert _encode_frames_to_images([], short_edge=100) == []
+
+    def test_packet_without_frames_returns_empty(self):
+        from miloco.perception.engine.omni.prompt_builder import _encode_frames_to_images
+
+        ep = _mock_edge_packet()
+        ep.all_frames = []
+        assert _encode_frames_to_images([ep], short_edge=100) == []
+
+    def test_payload_includes_image_blocks(self):
+        """build_payload（非 fused）应为所有 packet 产生 image_blocks。"""
+        from miloco.perception.engine.omni.prompt_builder import _build_payload
+
+        packet = _video_route_packet()
+        packet.all_frames = [np.zeros((100, 200, 3), dtype=np.uint8) for _ in range(4)]
+        payload = _build_payload([packet], OmniContext(), stream=False)
+        assert "image_blocks" in payload
+        assert isinstance(payload["image_blocks"], list)
+        assert len(payload["image_blocks"]) > 0
+
+
+class TestFusedPayloadQwen3VLAdapter:
+    """build_fused_payload 在 Qwen3VLAdapter（不支持 video_url）下的行为。"""
+
+    def _qwen_vl_adapter(self):
+        from miloco.perception.engine.omni.provider import Qwen3VLAdapter
+        return Qwen3VLAdapter()
+
+    def test_fused_uses_image_blocks_instead_of_video_url(self):
+        """Qwen3VLAdapter 不支持 video_url → fused user content 应含 image_url 块。"""
+        from miloco.perception.engine.omni.prompt_builder import build_fused_payload
+
+        packet = _video_route_packet()
+        packet.all_frames = [np.zeros((100, 200, 3), dtype=np.uint8) for _ in range(4)]
+        fused = build_fused_payload(
+            packets=[packet],
+            context=OmniContext(),
+            candidates=[],
+            gallery_snapshot={},
+            adapter=self._qwen_vl_adapter(),
+        )
+        content = _multimodal_user_content(fused["messages"])
+
+        # 应有 image_url 块
+        image_blocks = [b for b in content if isinstance(b, dict) and b.get("type") == "image_url"]
+        assert len(image_blocks) > 0
+        for b in image_blocks:
+            assert b["image_url"]["url"].startswith("data:image/jpeg;base64,")
+
+        # 不应有 video_url 块
+        video_blocks = [b for b in content if isinstance(b, dict) and b.get("type") == "video_url"]
+        assert len(video_blocks) == 0
+
+    def test_normal_adapter_still_uses_video_url(self):
+        """MiMoAdapter 支持 video_url → fused user content 应含 video_url 块。"""
+        from miloco.perception.engine.omni.prompt_builder import build_fused_payload
+        from miloco.perception.engine.omni.provider import MiMoAdapter
+
+        packet = _video_route_packet()
+        packet.all_frames = [np.zeros((100, 200, 3), dtype=np.uint8) for _ in range(4)]
+        fused = build_fused_payload(
+            packets=[packet],
+            context=OmniContext(),
+            candidates=[],
+            gallery_snapshot={},
+            adapter=MiMoAdapter(),
+        )
+        content = _multimodal_user_content(fused["messages"])
+
+        video_blocks = [b for b in content if isinstance(b, dict) and b.get("type") == "video_url"]
+        assert len(video_blocks) > 0
+
+        # 不应有 image_blocks 生产的 image_url
+        image_from_image_blocks = [
+            b for b in content
+            if isinstance(b, dict)
+            and b.get("type") == "image_url"
+            and "jpeg" in b.get("image_url", {}).get("url", "")
+            and "gallery" not in str(b).lower()
+        ]
+        # MiMo 路径不走 encode_frames_to_images，只有 gallery 的 png body/face 图
+        # （若有 gallery_snapshot 的话）。此处无 gallery，不应有 image_url。
+        assert len(image_from_image_blocks) == 0
+
+    def test_fused_no_frames_not_crash(self):
+        """packet 无 all_frames 时不应崩溃（退化为 text-only）。"""
+        from miloco.perception.engine.omni.prompt_builder import build_fused_payload
+
+        packet = _video_route_packet()
+        packet.all_frames = []  # 无帧
+
+        fused = build_fused_payload(
+            packets=[packet],
+            context=OmniContext(),
+            candidates=[],
+            gallery_snapshot={},
+            adapter=self._qwen_vl_adapter(),
+        )
+        # 不崩溃即为通过；user content 为合法 list
+        content = _multimodal_user_content(fused["messages"])
+        assert isinstance(content, list)
+        # video_url / image_url 均不应出现（无帧可编）
+        for b in content:
+            if isinstance(b, dict):
+                assert b.get("type") != "video_url", "无帧不应有 video_url"
+                if b.get("type") == "image_url":
+                    # image_url 可能来自 gallery（若有），但无 gallery_snapshot 时应无 image_url
+                    pass

@@ -361,7 +361,12 @@ def _build_messages(payload: dict, adapter: OmniProviderAdapter) -> list[dict]:
     media_info = payload.get("media_info")
 
     if payload.get("video_base64"):
-        content.append(adapter.build_video_block(payload["video_base64"], media_info))
+        if not getattr(adapter, "supports_video_input", True):
+            for img_b64 in payload.get("image_blocks", []):
+                if img_b64 and img_b64.strip():
+                    content.append(adapter.build_image_block(img_b64))  # type: ignore[attr-defined]
+        else:
+            content.append(adapter.build_video_block(payload["video_base64"], media_info))
     elif payload.get("audio_base64"):
         content.append(adapter.build_audio_block(payload["audio_base64"], media_info))
 

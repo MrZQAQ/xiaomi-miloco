@@ -109,6 +109,7 @@
     "deleteSuccess": "已删除",
     "deleteFailed": "删除失败",
     "modelsEmptyResult": "该地址未返回模型列表",
-    "modelsFetchFailed": "拉取模型失败"
+    "modelsFetchFailed": "拉取模型失败",
+    "vlModelWarning": "当前选择为纯视觉(VL)模型，不支持音频输入。感知引擎将忽略音频信号，无法辨别门铃、报警等音频事件。"
   }
 }

@@ -109,6 +109,7 @@
     "deleteSuccess": "Deleted",
     "deleteFailed": "Couldn't delete",
     "modelsEmptyResult": "This address returned no model list",
-    "modelsFetchFailed": "Couldn't fetch models"
+    "modelsFetchFailed": "Couldn't fetch models",
+    "vlModelWarning": "This is a vision-only (VL) model without audio input support. The perception engine will ignore audio signals and will not detect audio events such as doorbells or alarms."
   }
 }

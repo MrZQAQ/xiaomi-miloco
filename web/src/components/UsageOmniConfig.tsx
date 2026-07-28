@@ -71,6 +71,10 @@ function errFieldOf(code: string | null): "url" | "key" | "model" {
   return "model";
 }
 
+function isVlModel(name: string): boolean {
+  return /vl/i.test(name);
+}
+
 function hostOf(url: string): string {
   try {
     return new URL(url).host;
@@ -751,6 +755,11 @@ export function UsageOmniConfig() {
                               ? t("usage.modelsCount", { n: models.length })
                               : t("usage.modelsHint")}
                     </span>
+                    {isVlModel(model) && (
+                      <span className="text-caption text-warning bg-warning-bg rounded-lg px-3 py-1.5 mt-2 block">
+                        {t("usage.vlModelWarning")}
+                      </span>
+                    )}
                   </Field>
                   <div className="md:col-span-2 pt-1 flex items-center gap-3 flex-wrap">
                     <button

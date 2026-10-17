@@ -64,6 +64,8 @@ interface Props {
   scopeCameras: ScopeCamera[];
   /** miot 上是否有 camera 类设备——区分两种空态 */
   miotHasCamera: boolean;
+  /** 米家授权是否已失效——失效时空态要说清真实原因，别引导住户去开开关。 */
+  miotAuthDegraded?: boolean;
   /** 最多投喂给 miloco 的摄像头数(后端 MAX_ENABLED_CAMERAS，经 /api/miot/status 下发)。
    *  上区展示数受 connected 自然约束，此值只用于下区「启用」按钮的满额置灰判断。 */
   maxStreamCams: number;
@@ -103,6 +105,7 @@ export function HeroNow({
   petsEnabled = false,
   scopeCameras,
   miotHasCamera,
+  miotAuthDegraded,
   maxStreamCams,
   onPersonClick,
   onJumpUsage,
@@ -216,6 +219,7 @@ export function HeroNow({
         benchCams={benchCams}
         maxStreamCams={maxStreamCams}
         miotHasCamera={miotHasCamera}
+        miotAuthDegraded={miotAuthDegraded}
         onToggleCameras={onToggleCameras}
         onToggleCameraVoice={onToggleCameraVoice}
         onSetCameraPrompt={onSetCameraPrompt}
@@ -235,6 +239,8 @@ interface CameraSectionProps {
   /** 最多投喂数(后端 MAX_ENABLED_CAMERAS)，用于满额置灰下区「启用」 */
   maxStreamCams: number;
   miotHasCamera: boolean;
+  /** 米家授权是否已失效——失效时空态要说清真实原因，别引导住户去开开关。 */
+  miotAuthDegraded?: boolean;
   onToggleCameras: (dids: string[], inUse: boolean) => void | Promise<void>;
   onToggleCameraVoice: (did: string, voiceInUse: boolean) => void | Promise<void>;
   onSetCameraPrompt: (did: string, text: string) => void | Promise<void>;
@@ -248,6 +254,7 @@ function CameraSection({
   benchCams,
   maxStreamCams,
   miotHasCamera,
+  miotAuthDegraded,
   onToggleCameras,
   onToggleCameraVoice,
   onSetCameraPrompt,
@@ -481,7 +488,11 @@ function CameraSection({
             </div>
           ) : (
             <div className="text-body rounded-lg bg-bg-primary border border-dashed border-border-strong text-text-secondary py-6 px-5 text-center">
-              {t("hero.noStreaming")}
+              {/* 授权失效时别说「打开开关开启感知」——开关不是原因，开了也没用。
+                  失效后拉相机列表就会被拒，感知没有相机可跑。 */}
+              {miotAuthDegraded
+                ? t("hero.noStreamingAuthDegraded")
+                : t("hero.noStreaming")}
             </div>
           )}
           {/* 下区:未投喂给 miloco 的相机(未启用 / 超出上限)。不拉流、不展示小窗，
@@ -923,6 +934,7 @@ function CamCardWithToggle({
   hasPrompt,
   onEditPrompt,
 }: CamCardProps) {
+  const { t } = useTranslation();
   return (
     <div className="snap-start shrink-0 w-[min(280px,85vw)]">
       <div className="relative">
@@ -960,6 +972,22 @@ function CamCardWithToggle({
           />
         </div>
       </div>
+      {/* 跨网段 + 探测可达 + 拉流一直连不上 —— 给可执行的两个方向，而不是让住户干等
+          一个永远连不上的"连接中"（见 backend list_cameras_with_state 的 stream_error）。
+
+          必须挂在**上区**：接口的 ``connected`` 取自感知适配器有没有解码订阅，而
+          ``stream_error`` 的前提是**原生** camera_status 尚未 CONNECTED —— 两者不是
+          同一个概念。而 stream_nat_blocked 要成立就需要有连接起始时间戳，那个时间戳
+          在原生会话管理器创建时就已播种（不依赖状态回调，见 client.py refresh_cameras
+          创建分支）；管理器一在，解码订阅必然成功 ⇒ 接口 connected=true ⇒ 这台相机
+          一定落在上区。所以只挂下区的 BenchCamItem 时这条提示永远不渲染（下区那两类
+          相机压根没有管理器，stream_error 恒为 None）。下区也保留一份：
+          自愈重连断开与下轮重连之间那一瞬相机会短暂落到下区。 */}
+      {cam.streamError === "cross_subnet_nat" && (
+        <p className="mt-1 text-caption text-warning">
+          {t("hero.streamErrorCrossSubnetNat")}
+        </p>
+      )}
     </div>
   );
 }
@@ -990,6 +1018,7 @@ function BenchCamItem({
   hasPrompt: boolean;
   onEditPrompt: () => void;
 }) {
+  const { t } = useTranslation();
   const available = cameraAvailable(cam);
   return (
     <li className="px-4 py-3 flex items-center justify-between gap-3 hover:bg-bg-tertiary transition-colors">
@@ -1017,6 +1046,13 @@ function BenchCamItem({
         </div>
         {/* 该路自己的三态灯（各路镜头 / 连通可能不同）。 */}
         <ChannelStateDots cam={cam} />
+        {/* 跨网段 + 探测可达 + 拉流一直连不上——给可执行的两个方向,而不是让住户干等
+            一个永远连不上的"连接中"（见 backend list_cameras_with_state 的 stream_error）。 */}
+        {cam.streamError === "cross_subnet_nat" && (
+          <p className="mt-1 text-caption text-warning max-w-md">
+            {t("hero.streamErrorCrossSubnetNat")}
+          </p>
+        )}
       </div>
       {/* 须知 + 拾音 + 投喂开关(各控本路;拾音相机级、仅有 mic 的通道显示)。拾音从属于感知:
           相机未启用(inUse=false)时置灰、显示为关。 */}

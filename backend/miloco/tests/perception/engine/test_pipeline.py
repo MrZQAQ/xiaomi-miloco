@@ -2,7 +2,8 @@
 
 import json
 import time
-from unittest.mock import AsyncMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
 
 import numpy as np
 import pytest
@@ -32,7 +33,9 @@ from miloco.perception.engine.types import (
     FrameInfo,
     FrameResolution,
     IdentityPacket,
+    IdentityTarget,
     MotionState,
+    ObjectType,
     OmniContext,
     RoomPipelineResult,
     RuleCondition,
@@ -467,7 +470,7 @@ async def test_batch_omni_error_partial():
     tracking = MockTrackingService(create_default_mock_response())
 
     # study-room 的 omni 失败、kitchen 成功（非 fused 路径走 run_omni_batch，edge_packet 带 room_name）
-    async def selective_omni_batch(edge_packets, context, cfg):
+    async def selective_omni_batch(edge_packets, context, cfg, **kwargs):
         if edge_packets[0].room_name == "study-room":
             raise OmniError("cam-1 omni boom")
         return RealtimePerceptionResult(
@@ -570,6 +573,299 @@ async def test_query_rooms_run_concurrently():
     assert max_concurrent == 2, f"on_demand 未并发, max={max_concurrent}"
     assert results["study-room"].answer == "有人在"
     assert results["kitchen"].answer == "有人在"
+
+
+class TestQueryMemberNames:
+    """从生产查询入口验证姓名接线，保留真实 pipeline、prompt 装配与视频编码。"""
+
+    member_id = "a1b2c3d4-1111-4444-8888-abcdef012345"
+    other_id = "e5f6a7b8-2222-4444-8888-abcdef012345"
+
+    @staticmethod
+    def _target(pid, *, bbox=(100, 100, 400, 900), verify=False, suppress=False):
+        return IdentityTarget(
+            type=ObjectType.HUMAN_WITH_FACE, person_id=pid, track_id=7,
+            needs_omni_verify=verify, suppress_as_prior=suppress,
+            box_info=[], bbox_xyxy_norm=bbox,
+        )
+
+    @pytest.fixture
+    def entry(self, monkeypatch):
+        from miloco.perception.engine.identity.library import PersonRef
+
+        library = Mock()
+        library.list_persons.return_value = [
+            PersonRef(self.member_id, "登记成员", None, True, 0),
+            PersonRef(self.other_id, "其他镜头成员", None, True, 0),
+        ]
+        build_library = Mock(return_value=library)
+        monkeypatch.setattr(
+            "miloco.perception.engine.identity.engine.build_identity_library", build_library,
+        )
+        monkeypatch.setattr("miloco.perception.engine.identity.tier_u.TierUPool", Mock())
+        monkeypatch.setattr("miloco.perception.engine.omni.dedup_embedder.EventEmbedder", Mock())
+        monkeypatch.setattr("miloco.perception.engine.api._voice_allowed_dids", lambda: set())
+        monkeypatch.setattr(
+            "miloco.perception.engine.omni.prompt_builder.get_home_profile_prefix",
+            lambda: "家庭档案中的另一个姓名",
+        )
+        monkeypatch.setattr(
+            "miloco.perception.engine.omni.prompt_builder._effective_panorama_short_edge", lambda: 128,
+        )
+        omni = AsyncMock(return_value={"choices": [{"message": {"content": "查询完成"}}]})
+        monkeypatch.setattr("miloco.perception.engine.omni.omni_client.call_omni", omni)
+
+        def make(*, disabled=False, targets=None):
+            config = PerceptionConfig()
+            config.input.fps = config.input.omni_fps = 1
+            config.identity_engine.enabled = not disabled
+            engine = PerceptionEngine(config)
+            monkeypatch.setattr(
+                engine, "_get_or_create_tracking_service",
+                lambda did, room: SimpleNamespace(did=did),
+            )
+            # 末设备 engine 不可用也不能丢掉共享库中的姓名。
+            monkeypatch.setattr(
+                engine, "_get_or_create_identity_engine",
+                lambda did, room: None if did == "cam-last" or disabled else Mock(),
+            )
+
+            async def identity(gate, config, tracking, **kwargs):
+                return IdentityPacket(
+                    packet_id=gate.packet_id, room_name=gate.room_name, timestamp=gate.timestamp,
+                    frame_info=FrameInfo(start_timestamp=0, end_timestamp=3000, fps=gate.fps),
+                    targets=(targets or {}).get(tracking.did, [self._target(self.member_id)]),
+                    scene_motion=MotionState.STATIC, frames=[], all_frames=gate.frames,
+                    audio_clip=gate.audio_clip,
+                    audio_analysis=AudioAnalysis(type=AudioType.SILENCE, is_urgent=False, energy_level=0.0),
+                    trigger=gate.trigger,
+                )
+
+            monkeypatch.setattr("miloco.perception.engine.pipeline.run_identity", identity)
+            return engine
+
+        return make, library, build_library, omni
+
+    @staticmethod
+    def _batch(*cameras):
+        return BatchedSnapshot(snapshots=[
+            _make_snapshot(room, did, [_solid(color, color, color)] * 3)
+            for room, did, color in cameras
+        ])
+
+    @staticmethod
+    def _video_color(payload):
+        import base64
+        import io
+
+        import av
+
+        with av.open(io.BytesIO(base64.b64decode(payload["video_base64"]))) as video:
+            frames = list(video.decode(video=0))
+        assert frames
+        return float(np.mean(frames[-1].to_ndarray(format="bgr24")))
+
+    async def test_names_from_shared_library_reach_omni_once_per_query(self, entry):
+        make, library, build_library, omni = entry
+        engine = make(targets={
+            "cam-last": [self._target(self.other_id)],
+            "cam-kitchen": [self._target(self.other_id)],
+        })
+        batch = self._batch(("study", "cam-first", 40), ("study", "cam-last", 210),
+                            ("kitchen", "cam-kitchen", 120))
+        result = await engine.on_demand_perceive(batch, "现在是谁？")
+
+        assert result.answer == "查询完成\n查询完成"
+        build_library.assert_called_once_with()
+        library.list_persons.assert_called_once_with()
+        assert omni.await_count == 2
+        for call, name, absent, color in zip(
+            omni.await_args_list, ["登记成员", "其他镜头成员"],
+            ["其他镜头成员", "登记成员"], [40, 120], strict=True,
+        ):
+            payload = call.args[0]
+            assert f"已确认成员线索：{name}[bbox=(100, 100, 400, 900)]" in payload["user_content"]
+            assert absent not in payload["user_content"]
+            assert self.member_id not in payload["user_content"]
+            assert self.other_id not in payload["user_content"]
+            assert "只有画面确认给出的 bbox 对应真人" in payload["system_prompt"]
+            assert abs(self._video_color(payload) - color) < 8
+
+    @pytest.mark.parametrize("case", ["missing", "empty", "blank", "unicode-blank", "empty-library", "read-error", "os-error", "permission-error", "unavailable", "disabled"])
+    async def test_missing_names_keep_query_and_generic_name_policy(self, entry, case, caplog):
+        from miloco.perception.engine.identity.library import PersonRef
+
+        make, library, build_library, omni = entry
+        if case in {"missing", "empty", "blank", "unicode-blank"}:
+            name = {"missing": None, "empty": "", "blank": "   ", "unicode-blank": "\u3000\t\n"}[case]
+            library.list_persons.return_value = [PersonRef(self.member_id, name, None, True, 0)]
+        elif case == "empty-library":
+            library.list_persons.return_value = []
+        elif case in {"read-error", "os-error", "permission-error"}:
+            error_type = {"read-error": RuntimeError, "os-error": OSError, "permission-error": PermissionError}[case]
+            library.list_persons.side_effect = error_type("private library detail")
+        elif case == "unavailable":
+            build_library.side_effect = RuntimeError("library unavailable")
+        engine = make(disabled=case == "disabled")
+        result = await engine.on_demand_perceive(self._batch(("study", "cam-first", 40)), "现在是谁？")
+
+        assert result.answer == "查询完成"
+        omni.assert_awaited_once()
+        payload = omni.await_args.args[0]
+        assert f"已确认成员线索：{self.member_id}[bbox=" in payload["user_content"]
+        assert "登记成员" not in payload["user_content"]
+        assert "家庭档案中的另一个姓名" not in payload["user_content"]
+        assert "确认有人但无法对应姓名时用“某人 / 陌生人”" in payload["system_prompt"]
+        assert "不把 ID 当人名输出" in payload["system_prompt"]
+        assert "不从家庭档案、历史描述或问题里给未确认身份的目标补姓名" in payload["system_prompt"]
+        if case in {"disabled", "unavailable"}:
+            library.list_persons.assert_not_called()
+        else:
+            library.list_persons.assert_called_once_with()
+        if case == "disabled":
+            build_library.assert_not_called()
+        if case in {"read-error", "os-error", "permission-error"}:
+            assert "Query name lookup failed" in caplog.text
+            assert f"error_type={error_type.__name__}" in caplog.text
+            assert "private library detail" not in caplog.text
+            records = [r for r in caplog.records if "Query name lookup failed" in r.getMessage()]
+            assert len(records) == 1
+            assert records[0].exc_info is None
+            assert records[0].stack_info is None
+
+    @pytest.mark.parametrize("name", ["登记成员", " 登记成员 "])
+    async def test_valid_name_spelling_survives_query_entry(self, entry, name):
+        from miloco.perception.engine.identity.library import PersonRef
+
+        make, library, _, omni = entry
+        library.list_persons.return_value = [PersonRef(self.member_id, name, None, True, 0)]
+        result = await make().on_demand_perceive(self._batch(("study", "cam-first", 40)), "现在是谁？")
+
+        assert result.answer == "查询完成"
+        library.list_persons.assert_called_once_with()
+        omni.assert_awaited_once()
+        assert f"已确认成员线索：{name}[bbox=" in omni.await_args.args[0]["user_content"]
+
+    @pytest.mark.parametrize("change", ["no-position", "recheck", "suppressed", "pending"])
+    async def test_library_name_does_not_bypass_visual_identity_gates(self, entry, change):
+        make, library, _, omni = entry
+        target = self._target(self.member_id, bbox=None if change == "no-position" else (100, 100, 400, 900),
+                              verify=change == "recheck", suppress=change == "suppressed")
+        if change == "pending":
+            target.person_id = "pending:" + self.member_id
+        engine = make(targets={"cam-first": [target]})
+        result = await engine.on_demand_perceive(self._batch(("study", "cam-first", 40)), "现在是谁？")
+
+        assert result.answer == "查询完成"
+        library.list_persons.assert_called_once_with()
+        omni.assert_awaited_once()
+        text = omni.await_args.args[0]["user_content"]
+        assert "目标（不提供可沿用的身份标签）" in text
+        assert "登记成员" not in text
+        assert self.member_id not in text
+
+    async def test_names_follow_actual_encoding_when_first_camera_fails(self, entry, monkeypatch):
+        import miloco.perception.engine.omni.prompt_builder as builder
+
+        make, library, _, omni = entry
+        engine = make(targets={"cam-last": [self._target(self.other_id)]})
+        engine._last_captions["cam-first"] = "首镜头历史中的姓名"
+        real_encode = builder._encode_video
+
+        def reject_first(packet, short_edge):
+            if float(np.mean(packet.all_frames[0])) < 100:
+                return None, None
+            return real_encode(packet, short_edge=short_edge)
+
+        monkeypatch.setattr(builder, "_encode_video", reject_first)
+        result = await engine.on_demand_perceive(
+            self._batch(("study", "cam-first", 40), ("study", "cam-last", 210)), "现在是谁？",
+        )
+
+        assert result.answer == "查询完成"
+        library.list_persons.assert_called_once_with()
+        omni.assert_awaited_once()
+        payload = omni.await_args.args[0]
+        assert "已确认成员线索：其他镜头成员[bbox=" in payload["user_content"]
+        assert "登记成员" not in payload["user_content"]
+        assert "首镜头历史中的姓名" not in payload["user_content"]
+        assert abs(self._video_color(payload) - 210) < 8
+
+    async def test_empty_video_never_uses_library_names_or_history(self, entry, monkeypatch):
+        make, library, _, omni = entry
+        engine = make()
+        engine._last_captions["cam-first"] = "历史姓名"
+        monkeypatch.setattr(
+            "miloco.perception.engine.omni.prompt_builder._encode_video", lambda *a, **k: (None, None),
+        )
+        result = await engine.on_demand_perceive(self._batch(("study", "cam-first", 40)), "现在是谁？")
+
+        assert result.answer == "查询完成"
+        library.list_persons.assert_called_once_with()
+        omni.assert_awaited_once()
+        payload = omni.await_args.args[0]
+        assert payload["video_base64"] is None
+        assert "本轮未提供有效视频，无法确认当前人员或场景" in payload["user_content"]
+        assert "登记成员" not in payload["user_content"]
+        assert "历史姓名" not in payload["user_content"]
+        assert self.member_id not in payload["user_content"]
+
+    async def test_frameless_query_stops_before_library_read(self, entry):
+        make, library, _, omni = entry
+        engine = make()
+        batch = BatchedSnapshot(snapshots=[
+            _make_snapshot("study", "cam-first", [], np.zeros(16000, dtype=np.int16)),
+        ])
+        result = await engine.on_demand_perceive(batch, "现在是谁？")
+
+        assert result.answer == ""
+        assert batch.snapshots == []
+        library.list_persons.assert_not_called()
+        omni.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_query_resolves_visual_input_mode_once_for_all_rooms():
+    """同一次多 room query 使用同一个 visual_input_mode 快照。"""
+    from miloco.perception.engine.pipeline import run_query_pipeline
+
+    frames = [_solid(100, 100, 100)] * 6
+    audio = np.zeros(16000, dtype=np.int16)
+    snap1 = _make_snapshot("study-room", "cam-study", frames, audio)
+    snap2 = _make_snapshot("kitchen", "cam-kitchen", frames, audio)
+    batch = BatchedSnapshot(snapshots=[snap1, snap2])
+
+    config = PerceptionConfig()
+    config.omni.api_key = "test-key"
+    tracking = MockTrackingService(create_default_mock_response())
+    captured_modes: list[str] = []
+
+    def capture_prompt(*, visual_input_mode, **kwargs):
+        captured_modes.append(visual_input_mode)
+        return {"messages": []}
+
+    with patch(
+        "miloco.perception.engine.pipeline._resolve_visual_input_mode",
+        side_effect=["image", "video"],
+    ) as resolve_mode, patch(
+        "miloco.perception.engine.omni.prompt_builder.build_query_prompt",
+        side_effect=capture_prompt,
+    ), patch(
+        "miloco.perception.engine.omni.omni_client.call_omni",
+        new_callable=AsyncMock,
+        return_value={"mock": "resp"},
+    ), patch(
+        "miloco.perception.engine.omni.response_parser.parse_query_response",
+        return_value="有人在",
+    ):
+        results = await run_query_pipeline(
+            batch, "现在有人吗", config,
+            get_tracking_service=lambda did, room_name: tracking,
+        )
+
+    assert resolve_mode.call_count == 1
+    assert captured_modes == ["image", "image"]
+    assert set(results) == {"study-room", "kitchen"}
 
 
 # =============================================================================
@@ -1868,3 +2164,204 @@ def test_display_falls_back_to_asia_shanghai_when_undetectable(
     ).strftime("%H:%M:%S")
     assert _fmt_clock(now_ms) == expected
     assert _fmt_time_window(now_ms, now_ms) == f"[{expected}-{expected}]"
+
+
+@pytest.mark.asyncio
+async def test_hold_trace_key_zero_when_gate_drops_frameless_window():
+    """零帧窗口被 gate 拦下时，trace 侧的 hold 标志必须为 0。
+
+    processor._publish_trace 用 (video_pass or audio_pass or hold_pass) 反推
+    gate_skipped，再据此决定建不建 identity / omni 的 trace。零帧 + 滞回期这一格里
+    packet 为 None、identity 与 omni 根本没跑；若 trace 仍写原始 hold_pass，这一轮会
+    凭空多一次 omni 调用记录（稀释 omni 错误率分母）、skip_rate 偏低、p95_rtf_omni 被
+    0 拉低、traces_device 留下一行读起来像"跑得飞快"的 identity_ms=0 / omni_ms=0。
+
+    状态机侧（HOLD_START / HOLD_EXPIRED / HOLD_RECOVERED）用的仍是原始 hold_pass，
+    由 test_empty_window_guard.py::test_zero_frames_quiet_audio_in_hold_does_not_open
+    钉住 —— 两个字段消费者不同，必须分开。
+    """
+    rng = np.random.default_rng(7)
+    quiet = (rng.standard_normal(16000) * 5).astype(np.int16)  # 非空但不过能量闸
+
+    # 第一窗有画面变化 → 让 gate 记下 last_visual_pass_ts，进入滞回期
+    gate_prev_frames: dict = {}
+    gate_last_visual_pass_ts: dict = {}
+    moving = [_solid(0, 0, 0)] * 2 + [_solid(255, 255, 255)] * 4
+    # 第二窗也留在 patch 作用域内：当前代码下 gate 会拦住、omni 不该被调，但这条用例存在
+    # 的意义正是防 gate 那道闸被改回去。不 patch 的话，闸失效时失败形态是网络错误 / 超时，
+    # 而不是下面那句写清楚的断言——CI 里读不出原因。
+    with patch(
+        "miloco.perception.engine.omni.omni.call_omni",
+        new_callable=AsyncMock,
+        return_value=MOCK_OMNI_RESPONSE,
+    ) as mock_omni:
+        await run_batch_pipeline(
+            BatchedSnapshot(snapshots=[_make_snapshot("living", "cam-1", moving, quiet)]),
+            {}, PerceptionConfig(),
+            gate_prev_frames=gate_prev_frames,
+            gate_last_visual_pass_ts=gate_last_visual_pass_ts,
+        )
+        assert gate_last_visual_pass_ts.get("cam-1") is not None, "前置：滞回期未建立"
+        mock_omni.reset_mock()
+
+        # 第二窗零帧 + 安静音频 + 仍在滞回期
+        frameless = _make_snapshot("living", "cam-1", [], quiet)
+        result = await run_batch_pipeline(
+            BatchedSnapshot(snapshots=[frameless]),
+            {}, PerceptionConfig(),
+            gate_prev_frames=gate_prev_frames,
+            gate_last_visual_pass_ts=gate_last_visual_pass_ts,
+        )
+
+    timing = result.rooms["living"].timing
+    assert timing["gate_hold_cam-1_pass"] == 0, (
+        "gate 没建包，trace 侧 hold 标志必须为 0，否则 processor 会误判 identity/omni 跑过"
+    )
+    assert result.rooms["living"].skipped is True
+    # gate 拦下这一窗 → omni 压根不该被调（闸被改回去时这条先红，失败原因一目了然）
+    mock_omni.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_hold_trace_key_zero_when_audio_route_opens_frameless_window():
+    """零帧 + 音频过闸 + 滞回期：建了包但走的是 audio 路由 → trace 侧 hold 标志为 0。
+
+    与 test_hold_trace_key_zero_when_gate_drops_frameless_window 成对，覆盖另一格：
+    那条是「gate 没建包」，这条是「建了包但不是滞回拉起的」。
+
+    这一列的消费者有两个，都要求 0：
+    - processor._publish_trace 反推 gate_skipped（这格 audio_pass=1，本来就不会误判）
+    - web 的 ChannelPass 拿它反推 route，且 holdPass 判断排在 audioPass 之前 —— 写 1 会
+      把 audio 路由的窗口标成 "video (hold)"，tooltip 还说「仍走 video 路由」，正好在
+      本 PR 最需要读准的那一格上误导验证者。
+    """
+    rng = np.random.default_rng(11)
+    loud = (rng.standard_normal(16000) * 20000).astype(np.int16)  # 过能量闸
+
+    gate_prev_frames: dict = {}
+    gate_last_visual_pass_ts: dict = {}
+    moving = [_solid(0, 0, 0)] * 2 + [_solid(255, 255, 255)] * 4
+    config = PerceptionConfig()
+    config.omni.api_key = "test-key"
+
+    with patch(
+        "miloco.perception.engine.omni.omni.call_omni",
+        new_callable=AsyncMock,
+        return_value=MOCK_OMNI_RESPONSE,
+    ) as mock_omni:
+        # 第一窗有画面变化 → 进入滞回期
+        await run_batch_pipeline(
+            BatchedSnapshot(snapshots=[_make_snapshot("living", "cam-1", moving, loud)]),
+            {}, config,
+            gate_prev_frames=gate_prev_frames,
+            gate_last_visual_pass_ts=gate_last_visual_pass_ts,
+        )
+        assert gate_last_visual_pass_ts.get("cam-1") is not None, "前置：滞回期未建立"
+        mock_omni.reset_mock()
+
+        # 第二窗零帧 + 响亮音频 + 仍在滞回期 → audio 路由建包
+        result = await run_batch_pipeline(
+            BatchedSnapshot(snapshots=[_make_snapshot("living", "cam-1", [], loud)]),
+            {}, config,
+            gate_prev_frames=gate_prev_frames,
+            gate_last_visual_pass_ts=gate_last_visual_pass_ts,
+        )
+
+    timing = result.rooms["living"].timing
+    # 必须先钉住「包真建出来了」：下面两条断言在「gate 压根没建包」时也都成立
+    # （gate_audio_pass 写在 _run_device 的早返回之前；没包时 hold 列恒 0），
+    # 不钉前提的话，gate 哪天收紧成「无帧一律不建包」这条用例会继续全绿、
+    # 而 docstring 声明要覆盖的那一格已经不存在 —— 变成为错误的理由通过。
+    assert result.rooms["living"].skipped is False, "前提：这一格必须真建出 packet"
+    mock_omni.assert_called_once()
+    assert timing["gate_audio_cam-1_pass"] == 1, "前置：这一格应由音频拉起"
+    assert timing["gate_hold_cam-1_pass"] == 0, (
+        "包是音频建的、实际 route=audio，trace 侧 hold 标志必须为 0，"
+        "否则 dashboard 会把这一窗标成 video (hold)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_gate_passed_equals_packet_built():
+    """`traces_v.gate_passed = video OR audio OR hold` 必须恒等于「本窗建了包」。
+
+    这条等价关系喂 stats 的 AVG(gate_passed) 与前端「整体过滤率」曲线。破坏它不会让任何
+    单行 trace 看起来可疑，只是把整条曲线挪一点——所以用测试守，不靠人验算。
+
+    刻意走 run_batch_pipeline 读真实落库的三个 timing 键，而不是在测试里复刻
+    `video_pass or audio_pass or hold_opened_window`：后者只能测 gate 内部，改 pipeline
+    落库那一行照样绿。
+    """
+    rng = np.random.default_rng(23)
+    loud = (rng.standard_normal(16000) * 20000).astype(np.int16)
+    quiet = (rng.standard_normal(16000) * 5).astype(np.int16)
+    silent = np.zeros(16000, dtype=np.int16)
+    still = [_solid(100, 100, 100)] * 6
+    moving = [_solid(0, 0, 0)] * 2 + [_solid(255, 255, 255)] * 4
+
+    config = PerceptionConfig()
+    config.omni.api_key = "test-key"
+
+    cases = [
+        ("有帧+运动", moving, silent, False),
+        ("有帧+静止+hold", still, silent, True),
+        ("有帧+静止+无hold", still, silent, False),
+        ("零帧+音频过闸+hold", [], loud, True),
+        ("零帧+音频过闸+无hold", [], loud, False),
+        ("零帧+音频未过闸+hold", [], quiet, True),
+        ("零帧+无音频+hold", [], silent, True),
+    ]
+
+    with patch(
+        "miloco.perception.engine.omni.omni.call_omni",
+        new_callable=AsyncMock,
+        return_value=MOCK_OMNI_RESPONSE,
+    ):
+        for name, frames, audio, hold in cases:
+            prev = {"cam-1": _preprocess(frames[0])} if frames else {}
+            last_v = {"cam-1": time.monotonic()} if hold else {}
+            result = await run_batch_pipeline(
+                BatchedSnapshot(snapshots=[_make_snapshot("living", "cam-1", frames, audio)]),
+                {}, config,
+                gate_prev_frames=prev,
+                gate_last_visual_pass_ts=last_v,
+            )
+            t = result.rooms["living"].timing
+            gate_passed = bool(
+                t["gate_video_cam-1_pass"]
+                or t["gate_audio_cam-1_pass"]
+                or t["gate_hold_cam-1_pass"]
+            )
+            built = not result.rooms["living"].skipped
+            assert gate_passed is built, (
+                f"[{name}] gate_passed={gate_passed} 但建包={built}"
+                " —— 整体过滤率曲线会静默偏移"
+            )
+
+
+@pytest.mark.asyncio
+async def test_gate_speech_prob_reaches_timing_detail():
+    """speech_prob 不带 "_" 前缀,经 _merge_results 加 "{room}/" 前缀进 timing_detail。
+
+    带 "_" 前缀的 key 要在 processor._publish_trace 有对应读取行才有出口,
+    speech_prob 没有专属列也没有那一行,带前缀就会被静默丢弃。
+    """
+    config = PerceptionConfig()
+    config.omni.api_key = "test-key"
+    gray = _solid(100, 100, 100)
+    silent = np.zeros(16000, dtype=np.int16)
+
+    with patch(
+        "miloco.perception.engine.omni.omni.call_omni",
+        new_callable=AsyncMock,
+        return_value=MOCK_OMNI_RESPONSE,
+    ):
+        result = await run_batch_pipeline(
+            BatchedSnapshot(snapshots=[_make_snapshot("living", "cam-1", [gray] * 6, silent)]),
+            {}, config,
+        )
+
+    merged = PerceptionEngine()._merge_results(result)
+
+    assert merged.timing is not None
+    assert "living/gate_speech_prob_cam-1" in merged.timing

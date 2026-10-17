@@ -19,6 +19,7 @@
     "cameraOfflineHint": "The backend may not be on the same LAN as the cameras, or the cameras haven't enabled LAN mode. After checking the network, try restarting miloco or the cameras.",
     "cameraEmpty": "No cameras at home yet · Connect Xiaomi Home cameras to see them here",
     "noStreaming": "No cameras perceiving yet, enable one to start",
+    "noStreamingAuthDegraded": "Mi Home authorization expired; perception has stopped. Rebind to restore.",
     "benchTitle": "Cameras not perceiving",
     "benchTitleFull": "Maxed out at {{n}} cameras, disable one to enable another",
     "stateCloudOnline": "Cloud online",
@@ -32,6 +33,7 @@
     "disabledLanHint": "Camera isn't reachable on the LAN (it may be on a different network from the miloco host); make sure the host and camera are on the same LAN before enabling.",
     "disabledLensHint": "Camera lens is closed; open the lens in Xiaomi Home before enabling.",
     "disabledCapacityHint": "Reached the max cameras enabled at once; turn one off first.",
+    "streamErrorCrossSubnetNat": "Cross-subnet streaming failed. Try putting the camera and host on the same network, or set the router to Full Cone / Open NAT",
     "refreshCamerasAria": "Refresh camera status",
     "refreshCamerasTitle": "Refresh",
     "toggleAriaInUse": "Disable {{name}}",
@@ -63,6 +65,7 @@
     "camPromptCancel": "Cancel",
     "camPromptSave": "Save",
     "watchItemWatching": "Watching",
+    "watchItemAuthStopped": "Watching stopped",
     "watchItemStandby": "Standby",
     "watchItemNotReady": "Not ready yet",
     "watchCtaRestart": "Restart perception",
@@ -71,6 +74,9 @@
     "miotConnected": "Xiaomi Home connected",
     "miotDevicesCount": "{{n}} devices",
     "miotNotConnected": "Xiaomi Home not connected",
-    "miotCtaConnect": "Connect now"
+    "miotCtaConnect": "Connect now",
+    "miotAuthDegraded": "Mi Home authorization expired · stopped",
+    "miotAuthDegradedHint": "Device control and perception have both stopped. Once authorization expires the camera list request is rejected too, so perception has no cameras to work with and stops rather than spinning. Re-authorize to restore — click Rebind.",
+    "miotAuthDegradedSince": "Device control and perception have both stopped. Once authorization expires the camera list request is rejected too, so perception has no cameras to work with and stops rather than spinning. Re-authorize to restore — click Rebind. Invalid since {{since}}."
   }
 }

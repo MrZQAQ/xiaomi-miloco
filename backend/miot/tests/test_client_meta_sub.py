@@ -21,14 +21,19 @@ touch — no OAuth / camera / network stack required.
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from miot.action_result import SOURCE_CLOUD, SOURCE_LOCAL_CENTRAL
 from miot.client import MIoTClient
 from miot.types import MipsConnectionError
 
 from miot import client as client_mod
+
+# 无真实网络/凭据/设备依赖 —— CI 的 `miot 单元测试` 步骤按 `-m unit` 选择。
+pytestmark = pytest.mark.unit
 
 
 class _FakeMips:
@@ -49,6 +54,9 @@ def _bare_client(mips: _FakeMips | None) -> MIoTClient:
     client._meta_sub_dids = set()
     client._scene_sub_home_ids = set()
     client._state_sub_dids = set()
+    client._props_sub_dids = set()
+    client._props_sub_sources = {}
+    client._props_source_lock = asyncio.Lock()
     client._mips_cloud = mips
     client._callback_device_meta_changed = None
     client._callback_scene_changed = None
@@ -171,12 +179,14 @@ class _SetupFakeMips:
         self.is_connected = True
         self._fail_meta_dids = set(fail_meta_dids)
         self._fail_state_dids: set[str] = set()
+        self._fail_props_dids: set[str] = set()
         self.init_async = AsyncMock()
         self.sub_user_bind_async = AsyncMock()
         self.sub_user_unbind_async = AsyncMock()
         self.sub_device_meta_changed_async = AsyncMock(side_effect=self._meta)
         self.sub_home_scene_changed_async = AsyncMock()
         self.sub_device_state_async = AsyncMock(side_effect=self._state)
+        self.sub_device_props_async = AsyncMock(side_effect=self._props)
 
     async def _meta(self, did: str, handler) -> None:
         if did in self._fail_meta_dids:
@@ -186,13 +196,17 @@ class _SetupFakeMips:
         if did in self._fail_state_dids:
             raise RuntimeError(f"SUBACK rejected for {did}")
 
+    async def _props(self, did: str, handler) -> None:
+        if did in self._fail_props_dids:
+            raise RuntimeError(f"SUBACK rejected for {did}")
+
     def register_subscribe_error_handler(self, cb) -> None: ...
     def register_subscribe_success_handler(self, cb) -> None: ...
     def register_mips_state_handler(self, cb) -> None: ...
 
 
 def _setup_client(
-    monkeypatch, fake, *, meta_dids, scene_home_ids, state_dids=()
+    monkeypatch, fake, *, meta_dids, scene_home_ids, state_dids=(), props_dids=()
 ) -> MIoTClient:
     monkeypatch.setattr(client_mod, "MIoTMipsCloud", lambda **kw: fake)
     client = MIoTClient.__new__(MIoTClient)
@@ -207,9 +221,13 @@ def _setup_client(
     client._meta_sub_dids = set(meta_dids)
     client._scene_sub_home_ids = set(scene_home_ids)
     client._state_sub_dids = set(state_dids)
+    client._props_sub_dids = set(props_dids)
+    client._props_sub_sources = {d: SOURCE_CLOUD for d in props_dids}
+    client._props_source_lock = asyncio.Lock()
     client._callback_device_meta_changed = None
     client._callback_scene_changed = None
     client._callback_device_state_changed = None
+    client._callback_device_props_changed = None
     client._callback_subscription_reset = None
     client._callback_mips_connect = None
     return client
@@ -381,6 +399,47 @@ async def test_setup_replay_state_partial_failure_keeps_failed_untracked(
 
 
 @pytest.mark.asyncio
+async def test_setup_replays_props_subscriptions(monkeypatch):
+    """re-OAuth 后 mips 是新实例，broker 上一个属性订阅都不剩，得整批重下。"""
+    fake = _SetupFakeMips()
+    client = _setup_client(
+        monkeypatch,
+        fake,
+        meta_dids=set(),
+        scene_home_ids=set(),
+        props_dids={"dev-1", "dev-2"},
+    )
+
+    await client._setup_mips_async()
+
+    assert {c.args[0] for c in fake.sub_device_props_async.await_args_list} == {
+        "dev-1",
+        "dev-2",
+    }
+    assert client._props_sub_dids == {"dev-1", "dev-2"}
+
+
+@pytest.mark.asyncio
+async def test_setup_replay_props_partial_failure_keeps_failed_untracked(
+    monkeypatch,
+):
+    fake = _SetupFakeMips()
+    fake._fail_props_dids = {"dev-bad"}
+    client = _setup_client(
+        monkeypatch,
+        fake,
+        meta_dids=set(),
+        scene_home_ids=set(),
+        props_dids={"dev-ok", "dev-bad"},
+    )
+
+    await client._setup_mips_async()
+
+    # dev-bad 重放失败 → 不记回集合，下一轮对账才会看见缺口并重试
+    assert client._props_sub_dids == {"dev-ok"}
+
+
+@pytest.mark.asyncio
 async def test_setup_mips_fires_subscription_reset_with_post_replay_sets(monkeypatch):
     """The upper-layer mirror invalidation callback must fire AFTER replay,
     passing the post-replay tracked sets — so the mirror can be a faithful
@@ -402,10 +461,11 @@ async def test_setup_mips_fires_subscription_reset_with_post_replay_sets(monkeyp
     # Callback fired exactly once, after replay, with the post-replay sets:
     # dev-bad's replay failed → dropped from the meta set; dev-a succeeded.
     assert len(received) == 1
-    meta_dids, state_dids, scene_home_ids = received[0]
+    meta_dids, state_dids, scene_home_ids, props_dids = received[0]
     assert meta_dids == {"dev-a"}
     assert state_dids == set()
     assert scene_home_ids == set()
+    assert props_dids == set()
 
 
 @pytest.mark.asyncio
@@ -436,7 +496,7 @@ async def test_setup_mips_connect_failure_clears_tracked_and_fires_reset(monkeyp
     assert client._state_sub_dids == set()
     assert client._scene_sub_home_ids == set()
     assert len(received) == 1
-    assert received[0] == (set(), set(), set())
+    assert received[0] == (set(), set(), set(), set())
 
 
 # ------------------------------------ mips_user_sub_error scoping (reconnect)
@@ -577,3 +637,39 @@ async def test_get_devices_partial_shrink_triggers_guard(monkeypatch):
     res = await client.get_devices_async()
     assert set(res) == {"d1", "d2"}  # merged normally
     assert client._device_shrink_streak == 0
+
+
+@pytest.mark.asyncio
+async def test_setup_replay_leaves_local_props_subs_alone(monkeypatch):
+    """mips 重建只该重放**非本地**那批。
+
+    本地订阅挂在中枢的 client 实例上，mips 重建不会让它们消失。一并抹掉镜像
+    会让重放把它当「从零重订」：此刻若网关不可用（can_push 假）就改判到云端，
+    而「它原来在本地」这个事实已随镜像消失 —— 那条活着的本地订阅既没人退也没人
+    记得，网关回来重放 _broadcasts 就是两条通道同时在投。
+    """
+    fake = _SetupFakeMips()
+    client = _setup_client(
+        monkeypatch,
+        fake,
+        meta_dids=set(),
+        scene_home_ids=set(),
+        props_dids={"dev-cloud", "dev-local"},
+    )
+    client._props_sub_sources = {
+        "dev-cloud": SOURCE_CLOUD,
+        "dev-local": SOURCE_LOCAL_CENTRAL,
+    }
+
+    await client._setup_mips_async()
+
+    # 只重放云端那台
+    assert [c.args[0] for c in fake.sub_device_props_async.await_args_list] == [
+        "dev-cloud"
+    ]
+    # 本地那台原样留着，镜像也没被动
+    assert client._props_sub_dids == {"dev-cloud", "dev-local"}
+    assert client._props_sub_sources == {
+        "dev-cloud": SOURCE_CLOUD,
+        "dev-local": SOURCE_LOCAL_CENTRAL,
+    }

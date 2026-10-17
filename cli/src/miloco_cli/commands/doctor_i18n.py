@@ -199,6 +199,9 @@ _ZH: dict[str, str] = {
     "account.unbound.fix": "miloco-cli account login",
     "account.bound.name": "小米账号绑定",
     "account.bound.message": "已绑定 Xiaomi 账号 (uid: {uid})",
+    "account.degraded.name": "小米账号授权",
+    "account.degraded.message": "授权已被云端拒绝（uid: {uid}，自 {since} 起）——设备控制与感知均已停止，需重新授权才能恢复",
+    "account.degraded.fix": "重新授权：web 上点状态条的「重新绑定」，或运行 miloco-cli account bind",
     "home.none.name": "家庭配置",
     "home.none.message": "账号下无启用的家庭",
     "home.none.fix": (
@@ -230,10 +233,10 @@ _ZH: dict[str, str] = {
     "reach.subnet.mismatch.name": "网段匹配",
     "reach.subnet.mismatch.message": "目标 IP {ip} 与本机任一网卡均不同网段",
     "reach.subnet.mismatch.fix": (
-        "PPCS 打洞跨网段成功率低。若确需跨网段, 请确认:\n"
-        "  1. 两个网段之间存在三层可达\n"
-        "  2. 路由器/网关允许 UDP 双向转发\n"
-        "  3. 摄像头/主机均无静态 ACL 拦截"
+        "摄像头与主机不在同一网段, 只能靠单播直连。请确认:\n"
+        "  1. 主机到摄像头 IP 三层可达(路由通、有网关转发)\n"
+        "  2. 途中 NAT 非对称类型(对称 NAT 每次换端口, 直连会失败)\n"
+        "  3. 两侧无防火墙/ACL 拦 UDP"
     ),
     "reach.route.none.name": "路由出接口",
     "reach.route.none.message": "路由表无法给出到目标的出接口",
@@ -252,6 +255,8 @@ _ZH: dict[str, str] = {
     "reach.l3.fail.name": "L3 可达",
     "reach.l3.fail.message": "ping 失败, ARP 表状态: {state}",
     "reach.l3.fail.unknown": "未知",
+    "reach.l3.udp_reach.name": "L3 可达",
+    "reach.l3.udp_reach.message": "ping 失败, 但 UDP 探测到达目标 (收到 ICMP Port Unreachable), 对端仅拦 ICMP",
     "reach.udp.iface_suffix_full": " (出接口 {iface}, src {src})",
     "reach.udp.iface_suffix_ip_only": " (src {src})",
     "reach.udp.blocked.name": "UDP 探测",
@@ -464,6 +469,9 @@ _EN: dict[str, str] = {
     "account.unbound.fix": "miloco-cli account login",
     "account.bound.name": "Xiaomi account binding",
     "account.bound.message": "Xiaomi account bound (uid: {uid})",
+    "account.degraded.name": "Xiaomi account authorization",
+    "account.degraded.message": "Authorization rejected by the cloud (uid: {uid}, since {since}) - device control and perception have both stopped; re-authorize to restore",
+    "account.degraded.fix": "Re-authorize: click Rebind on the status ribbon in the web console, or run miloco-cli account bind",
     "home.none.name": "Home configuration",
     "home.none.message": "No active home under this account",
     "home.none.fix": (
@@ -494,10 +502,10 @@ _EN: dict[str, str] = {
     "reach.subnet.mismatch.name": "Subnet match",
     "reach.subnet.mismatch.message": "Target IP {ip} is on a different subnet than any local NIC",
     "reach.subnet.mismatch.fix": (
-        "PPCS hole punching across subnets has low success rate. If cross-subnet is required, verify:\n"
-        "  1. L3 reachability exists between the two subnets\n"
-        "  2. Router/gateway allows bidirectional UDP forwarding\n"
-        "  3. Neither camera nor host has a static ACL blocking traffic"
+        "Camera and host are on different subnets; only unicast direct connection works. Verify:\n"
+        "  1. L3 reachability from host to camera IP (route exists, gateway forwards)\n"
+        "  2. NAT in the path is non-symmetric (symmetric NAT changes ports and breaks direct connection)\n"
+        "  3. No firewall/ACL blocks UDP on either side"
     ),
     "reach.route.none.name": "Route egress interface",
     "reach.route.none.message": "Routing table cannot provide an egress interface to the target",
@@ -517,6 +525,8 @@ _EN: dict[str, str] = {
     "reach.l3.fail.name": "L3 reachability",
     "reach.l3.fail.message": "ping failed, ARP state: {state}",
     "reach.l3.fail.unknown": "unknown",
+    "reach.l3.udp_reach.name": "L3 reachability",
+    "reach.l3.udp_reach.message": "ping failed, but UDP reached target (ICMP Port Unreachable received); peer only filters ICMP",
     "reach.udp.iface_suffix_full": " (via {iface}, src {src})",
     "reach.udp.iface_suffix_ip_only": " (src {src})",
     "reach.udp.blocked.name": "UDP probe",

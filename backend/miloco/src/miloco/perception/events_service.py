@@ -23,17 +23,22 @@ from typing import TYPE_CHECKING, Literal
 
 from pydantic import ValidationError
 
-from miloco.perception.schema import EventCropMeta, MeaningfulEvent
+from miloco.perception.schema import EventCropMeta, MeaningfulEvent, VisualArtifactKind
 from miloco.perception.snapshot_writer import (
     CLIP_CANDIDATES,
+    IMAGE_AUDIO_FILENAME,
     get_snapshot_root,
+    image_frame_files,
     locate_clip_file,
+    locate_image_frame_file,
     region_slug,
 )
 from miloco.utils.paths import miloco_home
 
 if TYPE_CHECKING:
     from miloco.database.meaningful_events_dao import MeaningfulEventDao
+
+from miloco.utils.common import safe_log
 
 logger = logging.getLogger(__name__)
 
@@ -53,19 +58,6 @@ _REF_FILENAME = "ref.jpg"
 _TRACE_FILENAME = "omni_trace.json.gz"
 
 
-def _safe_log(value: object) -> str:
-    """写日志前去掉 CR/LF,防 log injection(CodeQL py/log-injection).同 schedule/router._safe_log.
-
-    凡来自 URL path / query / 配置 / 模型输出的值,写进日志前都该过一遍 —— 即便调用点
-    当下有校验保证注不进换行,那是**调用方校验**给的安全,不是这行日志自己的;校验哪天
-    放宽,伪造整行就会直接落进日志,而这种回归不会有任何测试变红.
-
-    注意保留 `.replace("\\n", ...)` 的字面量形态:CodeQL 只认第一个实参是字面量
-    "\\n" / "\\r\\n" 的 replace 为 sanitizer,改成正则或变量会重新触发告警.
-    """
-    return str(value).replace("\r", "").replace("\n", " ")
-
-
 def probe_has_ref(snapshot_root: Path, event_id: str, device_ids: list[str]) -> bool:
     """任一 device 目录下有 ref.jpg → True(该事件走了 Smart Crop,有全景参考帧).
 
@@ -76,6 +68,40 @@ def probe_has_ref(snapshot_root: Path, event_id: str, device_ids: list[str]) -> 
         if (snapshot_root / event_id / region_slug(did) / _REF_FILENAME).exists():
             return True
     return False
+
+
+def probe_image_frame_counts(
+    snapshot_root: Path, event_id: str, device_ids: list[str]
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for did in device_ids:
+        count = len(image_frame_files(snapshot_root / event_id / region_slug(did)))
+        if count:
+            counts[did] = count
+    return counts
+
+
+def probe_visual_artifacts(
+    snapshot_root: Path, event_id: str, device_ids: list[str]
+) -> tuple[VisualArtifactKind, bool, dict[str, int]]:
+    """从落盘文件推导事件当前可回放的载体，兼容 cleanup 后的 metadata-only。"""
+    image_counts = probe_image_frame_counts(snapshot_root, event_id, device_ids)
+    has_audio = False
+    has_video = False
+    for did in device_ids:
+        device_dir = snapshot_root / event_id / region_slug(did)
+        has_audio = has_audio or (device_dir / IMAGE_AUDIO_FILENAME).exists()
+        clip = locate_clip_file(device_dir)
+        if clip is not None:
+            has_audio = has_audio or clip[0].suffix == ".m4a"
+            has_video = has_video or clip[0].suffix == ".mp4"
+    if image_counts:
+        return "images", has_audio, image_counts
+    if has_video:
+        return "video", has_audio, {}
+    if has_audio:
+        return "audio", True, {}
+    return "none", False, {}
 
 
 class EventsService:
@@ -116,6 +142,18 @@ class EventsService:
         snapshot_root = get_snapshot_root()
         feedback_index = self.build_feedback_index()
         return [self._row_to_event(row, snapshot_root, feedback_index) for row in rows]
+
+    async def get_event(self, event_id: str) -> MeaningfulEvent | None:
+        """按主键取单条,给「反查动作的宿主事件」那条路用。
+
+        与列表口径的差别只有一处、且是刻意的:**不带时间窗**。要反查的场景恰恰是
+        「这条事件已经翻出当前窗口了」,再拿窗口去套它等于把唯一需要它的那条路堵死。
+        取不到返回 None,由调用方决定怎么说——那不是故障。
+        """
+        row = self._dao.get_by_id(event_id)
+        if row is None:
+            return None
+        return self._row_to_event(row, get_snapshot_root(), self.build_feedback_index())
 
     async def locate_clip(
         self, event_id: str, device_id: str
@@ -178,6 +216,20 @@ class EventsService:
             return ("found", path, row["timestamp"])
         return ("gone", None, None)
 
+    async def locate_image_frame(
+        self, event_id: str, device_id: str, frame_index: int
+    ) -> tuple[SnapshotStatus, Path | None, int | None]:
+        """定位图片模式 canonical sequence 中的一张 JPEG。"""
+        row = self._dao.get_by_id(event_id)
+        if row is None or device_id not in row["device_ids"]:
+            return ("not_found", None, None)
+        path = locate_image_frame_file(
+            get_snapshot_root() / event_id / region_slug(device_id), frame_index
+        )
+        if path is None:
+            return ("gone", None, None)
+        return ("found", path, row["timestamp"])
+
     async def read_crop_meta(
         self, event_id: str, device_id: str
     ) -> tuple[CropMetaStatus, EventCropMeta | None]:
@@ -235,18 +287,20 @@ class EventsService:
                     # 这两个值来自 URL path.走到这里它们其实已过两道校验(_dao.get_by_id
                     # 查得到 + device_id 在 row["device_ids"] 内),即必然等于后端自己生成的
                     # UUID / 设备号,当下注不进换行 —— 但那是调用方校验给的安全,不是这行
-                    # 日志自己的,所以照样过 _safe_log。
+                    # 日志自己的,所以照样过 safe_log。
                     logger.warning(
                         "read_crop_meta bad crop meta event_id=%s device_id=%s: %s",
-                        _safe_log(event_id),
-                        _safe_log(device_id),
-                        e,
+                        safe_log(event_id),
+                        safe_log(device_id),
+                        safe_log(e),
                     )
                     return (self._no_box_status(event_id, device_id), None)
         except Exception as e:  # noqa: BLE001
             # path 里拼着 event_id,与上面那条同源 —— CodeQL 的 taint 没追进 Path 拼接
             # 只报了上面两处,但只清洗被点名的那处、留下这处,防线就是漏的。
-            logger.warning("read_crop_meta failed to parse trace %s: %s", _safe_log(path), e)
+            logger.warning(
+                "read_crop_meta failed to parse trace %s: %s", safe_log(path), safe_log(e)
+            )
             return (self._no_box_status(event_id, device_id), None)
         return (self._no_box_status(event_id, device_id), None)
 
@@ -287,6 +341,10 @@ class EventsService:
             return None
         for did in device_ids:
             device_dir = snapshot_root / event_id / region_slug(did)
+            # 图片模式的音频单独落为 audio.m4a；旧 clip_kind 不能把“图片+音频”
+            # 误报成纯音频，图片载体由 visual_artifact_kind 表达。
+            if image_frame_files(device_dir):
+                return None
             for filename in CLIP_CANDIDATES:
                 path = device_dir / filename
                 if path.exists():
@@ -339,6 +397,9 @@ class EventsService:
         event_id = row["id"]
         clip_kind = EventsService._probe_clip_kind(snapshot_root, event_id, device_ids)
         has_ref = probe_has_ref(snapshot_root, event_id, device_ids)
+        visual_kind, has_audio_artifact, image_frame_counts = probe_visual_artifacts(
+            snapshot_root, event_id, device_ids
+        )
         has_trace = (snapshot_root / event_id / "omni_trace.json.gz").exists()
         fb = feedback_index.get(event_id)
         has_feedback = fb is not None
@@ -360,4 +421,7 @@ class EventsService:
             feedback_pack_size=feedback_pack_size,
             clip_kind=clip_kind,
             has_ref=has_ref,
+            visual_artifact_kind=visual_kind,
+            image_frame_counts=image_frame_counts,
+            has_audio_artifact=has_audio_artifact,
         )

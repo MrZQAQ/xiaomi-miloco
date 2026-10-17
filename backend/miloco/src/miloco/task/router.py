@@ -17,9 +17,11 @@ from miloco.middleware.exceptions import (
 )
 from miloco.schema.common_schema import NormalResponse
 from miloco.task.schema import (
+    TaskActionsUpdateRequest,
     TaskCreateRequest,
     TaskUpdateRequest,
 )
+from miloco.utils.common import safe_log
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +30,7 @@ router = APIRouter(prefix="/tasks", tags=["Tasks"])
 
 @router.post("", summary="Create Task", response_model=NormalResponse)
 async def create_task(req: TaskCreateRequest, current_user: str = Depends(verify_token)):
-    logger.info("Create task - User: %s, task_id: %s", current_user, req.task_id)
+    logger.info("Create task - User: %s, task_id: %s", safe_log(current_user), safe_log(req.task_id))
     try:
         get_manager().task_service.create_task(req)
     except TaskConflict as e:
@@ -38,7 +40,7 @@ async def create_task(req: TaskCreateRequest, current_user: str = Depends(verify
 
 @router.get("", summary="List Tasks (dedupe view)", response_model=NormalResponse)
 async def list_tasks(current_user: str = Depends(verify_token)):
-    logger.info("List tasks - User: %s", current_user)
+    logger.info("List tasks - User: %s", safe_log(current_user))
     views = get_manager().task_service.list_for_dedupe()
     return NormalResponse(
         code=0,
@@ -52,7 +54,7 @@ async def summary_tasks(
     window: Literal["day", "all"] = "day",
     current_user: str = Depends(verify_token),
 ):
-    logger.info("Summary tasks - User: %s, window: %s", current_user, window)
+    logger.info("Summary tasks - User: %s, window: %s", safe_log(current_user), safe_log(window))
     views = get_manager().task_service.list_summary(window)
     return NormalResponse(
         code=0,
@@ -63,7 +65,7 @@ async def summary_tasks(
 
 @router.get("/{task_id}", summary="Get Task", response_model=NormalResponse)
 async def get_task(task_id: str, current_user: str = Depends(verify_token)):
-    logger.info("Get task - User: %s, task_id: %s", current_user, task_id)
+    logger.info("Get task - User: %s, task_id: %s", safe_log(current_user), safe_log(task_id))
     view = get_manager().task_service.get_full_view(task_id)
     if view is None:
         raise ResourceNotFoundException(f"task_not_found: {task_id}")
@@ -71,25 +73,49 @@ async def get_task(task_id: str, current_user: str = Depends(verify_token)):
 
 
 @router.patch(
-    "/{task_id}", summary="Update Task Description", response_model=NormalResponse
+    "/{task_id}", summary="Update Task Meta", response_model=NormalResponse
 )
 async def update_task(
     task_id: str,
     req: TaskUpdateRequest,
     current_user: str = Depends(verify_token),
 ):
-    logger.info("Update task - User: %s, task_id: %s", current_user, task_id)
-    ok = get_manager().task_service.update_description(task_id, req)
+    logger.info(
+        "Update task - User: %s, task_id: %s", safe_log(current_user), safe_log(task_id)
+    )
+    ok = get_manager().task_service.update_meta(task_id, req)
     if not ok:
         raise ResourceNotFoundException(f"task_not_found: {task_id}")
     return NormalResponse(code=0, message="Task updated", data=None)
+
+
+@router.patch(
+    "/{task_id}/actions",
+    summary="Update Task Boundary Actions",
+    response_model=NormalResponse,
+)
+async def update_task_actions(
+    task_id: str,
+    req: TaskActionsUpdateRequest,
+    current_user: str = Depends(verify_token),
+):
+    """写 task 的边界动作槽。只有请求体里出现的槽会被改, 传 null 清空该槽。"""
+    logger.info(
+        "Update task actions - User: %s, task_id: %s",
+        safe_log(current_user),
+        safe_log(task_id),
+    )
+    ok = get_manager().task_service.set_boundary_actions(task_id, req)
+    if not ok:
+        raise ResourceNotFoundException(f"task_not_found: {task_id}")
+    return NormalResponse(code=0, message="Task actions updated", data=None)
 
 
 @router.post(
     "/{task_id}/disable", summary="Disable Task", response_model=NormalResponse
 )
 async def disable_task(task_id: str, current_user: str = Depends(verify_token)):
-    logger.info("Disable task - User: %s, task_id: %s", current_user, task_id)
+    logger.info("Disable task - User: %s, task_id: %s", safe_log(current_user), safe_log(task_id))
     try:
         result = get_manager().task_service.disable_task(task_id)
     except TaskNotFound as e:
@@ -99,7 +125,7 @@ async def disable_task(task_id: str, current_user: str = Depends(verify_token)):
 
 @router.post("/{task_id}/enable", summary="Enable Task", response_model=NormalResponse)
 async def enable_task(task_id: str, current_user: str = Depends(verify_token)):
-    logger.info("Enable task - User: %s, task_id: %s", current_user, task_id)
+    logger.info("Enable task - User: %s, task_id: %s", safe_log(current_user), safe_log(task_id))
     try:
         result = get_manager().task_service.enable_task(task_id)
     except TaskNotFound as e:
@@ -120,9 +146,9 @@ async def delete_task(
     """删 task。``reason`` 透传到 ``task_terminate_log.reason``（P4 接入事务体）。"""
     logger.info(
         "Delete task - User: %s, task_id: %s, reason: %s",
-        current_user,
-        task_id,
-        reason,
+        safe_log(current_user),
+        safe_log(task_id),
+        safe_log(reason),
     )
     result = get_manager().task_service.delete_task(task_id, reason=reason)
     if result is None:
